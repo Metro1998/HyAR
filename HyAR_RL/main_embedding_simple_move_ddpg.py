@@ -172,8 +172,8 @@ def run(args):
     action_rep = ActionRepresentation_vae.Action_representation(state_dim=state_dim,
                                                                   action_dim=discrete_action_dim,
                                                                   parameter_action_dim=1,
-                                                                  reduced_action_dim=discrete_emb_dim,
-                                                                  reduce_parameter_action_dim=parameter_emb_dim
+                                                                  action_embedding_dim=discrete_emb_dim,
+                                                                  parameter_action_embedding_dim=parameter_emb_dim
                                                                   )
     action_rep_target = copy.deepcopy(action_rep)
     replay_buffer = utils.ReplayBuffer(state_dim, discrete_action_dim=1,

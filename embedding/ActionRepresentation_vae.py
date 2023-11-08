@@ -12,7 +12,7 @@ import torch.optim as optim
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 import torch.nn.functional as functional
 
-
+# sb
 # Vanilla Variational Auto-Encoder
 class VAE(nn.Module):
     def __init__(self, state_dim, action_dim, action_embedding_dim, parameter_action_dim, latent_dim, max_action,
@@ -48,6 +48,13 @@ class VAE(nn.Module):
 
     def forward(self, state, action, action_parameter):
 
+        z, mean, std = self.encode(state, action, action_parameter)
+        u, s = self.decode(state, z, action)
+
+        return u, s, mean, std
+    
+    def encode(self, state, action, action_parameter):
+
         z_0 = F.relu(self.e0_0(torch.cat([state, action], 1)))
         z_1 = F.relu(self.e0_1(action_parameter))
         z = z_0 * z_1
@@ -61,11 +68,11 @@ class VAE(nn.Module):
 
         std = torch.exp(log_std)
         z = mean + std * torch.randn_like(std)
-        u, s = self.decode(state, z, action)
 
-        return u, s, mean, std
+        return z, mean, std
+        
 
-    def decode(self, state, z=None, action=None, clip=None, raw=False):
+    def decode(self, state, z=None, action=None, clip=None):
         # When sampling from the VAE, the latent vector is clipped to [-0.5, 0.5]
         if z is None:
             z = torch.randn((state.shape[0], self.latent_dim)).to(device)
@@ -79,11 +86,13 @@ class VAE(nn.Module):
 
         parameter_action = self.parameter_action_output(v)
 
+        # Cascade head to produce the prediction of the state residual of transition dynamics.
         v = F.relu(self.d3(v))
-        s = self.delta_state_output(v)
+        state_residual = self.delta_state_output(v)
 
-        if raw: return parameter_action, s
-        return self.max_action * torch.tanh(parameter_action), torch.tanh(s)
+        # Latent Space Constraint (LSC)
+        # In specific, we re-scale each dimension of the output of latent policy by tanh activation) to a bounded range [blower, bupper]. 
+        return self.max_action * torch.tanh(parameter_action), torch.tanh(state_residual)
 
 
 class Action_representation(NeuralNet):
@@ -91,26 +100,25 @@ class Action_representation(NeuralNet):
                  state_dim,
                  action_dim,
                  parameter_action_dim,
-                 reduced_action_dim=2,
-                 reduce_parameter_action_dim=2,
+                 action_embedding_dim,
+                 parameter_action_embedding_dim,
                  embed_lr=1e-4,
                  ):
         super(Action_representation, self).__init__()
+
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        # self.device = torch.device("cpu")
-        self.parameter_action_dim = parameter_action_dim
-        self.reduced_action_dim = reduced_action_dim
-        self.reduce_parameter_action_dim = reduce_parameter_action_dim
+
         self.state_dim = state_dim
         self.action_dim = action_dim
-        # Action embeddings to project the predicted action into original dimensions
-        # latent_dim=action_dim*2+parameter_action_dim*2
-        self.latent_dim = self.reduce_parameter_action_dim
+        self.parameter_action_dim = parameter_action_dim
+        self.action_ebedding_dim = action_embedding_dim
+        self.reduced_parameter_action_dim = parameter_action_embedding_dim
         self.embed_lr = embed_lr
-        self.vae = VAE(state_dim=self.state_dim, action_dim=self.action_dim,
-                       action_embedding_dim=self.reduced_action_dim, parameter_action_dim=self.parameter_action_dim,
-                       latent_dim=self.latent_dim, max_action=1.0,
+
+        self.vae = VAE(state_dim=self.state_dim, action_dim=self.action_dim, action_embedding_dim=self.action_ebedding_dim, 
+                       parameter_action_dim=self.parameter_action_dim, latent_dim=self.reduced_parameter_action_dim, max_action=1.0,
                        hidden_size=256).to(self.device)
+        
         self.vae_optimizer = torch.optim.Adam(self.vae.parameters(), lr=1e-4)
 
     def discrete_embedding(self, ):
