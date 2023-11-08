@@ -257,7 +257,7 @@ def run(args):
         print("load model")
         title = "vae" + "{}".format(str(40000))
         action_rep.load(title, save_dir)
-        print("load discrete embedding", action_rep.discrete_embedding())
+        print("load discrete embedding", action_rep.retrieve_embedding())
     print("pre VAE training phase started...")
     recon_s_loss = []
     c_rate, recon_s = vae_train(action_rep=action_rep, train_step=5000, replay_buffer=replay_buffer_embedding,
@@ -265,7 +265,7 @@ def run(args):
                                 save_dir=save_dir, vae_save_model=vae_save_model, embed_lr=1e-4)
 
     print("c_rate", c_rate)
-    print("discrete embedding", action_rep.discrete_embedding())
+    print("discrete embedding", action_rep.retrieve_embedding())
 
     # -------TD3训练------
     print("TD3 train")

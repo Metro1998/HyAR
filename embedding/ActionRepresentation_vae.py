@@ -121,48 +121,49 @@ class Action_representation(NeuralNet):
         
         self.vae_optimizer = torch.optim.Adam(self.vae.parameters(), lr=1e-4)
 
-    def discrete_embedding(self, ):
-        emb = self.vae.embeddings
+    def retrieve_embedding(self, ):
 
-        return emb
+        return self.vae.embeddings
 
-    def unsupervised_loss(self, s1, a1, a2, s2, sup_batch_size, embed_lr):
+    # def unsupervised_loss(self, s1, a1, a2, s2, sup_batch_size, embed_lr):
 
-        a1 = self.get_embedding(a1).to(self.device)
+    #     a1 = self.get_embedding(a1).to(self.device)
 
-        s1 = s1.to(self.device)
-        s2 = s2.to(self.device)
-        a2 = a2.to(self.device)
+    #     s1 = s1.to(self.device)
+    #     s2 = s2.to(self.device)
+    #     a2 = a2.to(self.device)
 
-        vae_loss, recon_loss_d, recon_loss_c, KL_loss = self.train_step(s1, a1, a2, s2, sup_batch_size, embed_lr)
-        return vae_loss, recon_loss_d, recon_loss_c, KL_loss
+    #     vae_loss, recon_loss_d, recon_loss_c, KL_loss = self.step(s1, a1, a2, s2, sup_batch_size, embed_lr)
+    #     return vae_loss, recon_loss_d, recon_loss_c, KL_loss
 
-    def loss(self, state, action_d, action_c, next_state, sup_batch_size):
+    def cal_loss(self, state, action, parameter_action, next_state):
 
-        recon_c, recon_s, mean, std = self.vae(state, action_d, action_c)
+        recon_param_action, pred_state, mean, std = self.vae(state, action, parameter_action)
 
-        recon_loss_s = F.mse_loss(recon_s, next_state, size_average=True)
-        recon_loss_c = F.mse_loss(recon_c, action_c, size_average=True)
+        param_action_loss = F.mse_loss(recon_param_action, parameter_action, size_average=True) 
+        pred_state_loss = F.mse_loss(pred_state, next_state, size_average=True) # 最终不是用residual state 进行的mse？
+        
 
         KL_loss = -0.5 * (1 + torch.log(std.pow(2)) - mean.pow(2) - std.pow(2)).mean()
 
         # vae_loss = 0.25 * recon_loss_s + recon_loss_c + 0.5 * KL_loss
         # vae_loss = 0.25 * recon_loss_s + 2.0 * recon_loss_c + 0.5 * KL_loss  #best
-        vae_loss = recon_loss_s + 2.0 * recon_loss_c + 0.5 * KL_loss
+        vae_loss = pred_state_loss + 2.0 * param_action_loss + 0.5 * KL_loss
         # print("vae loss",vae_loss)
         # return vae_loss, 0.25 * recon_loss_s, recon_loss_c, 0.5 * KL_loss
         # return vae_loss, 0.25 * recon_loss_s, 2.0 * recon_loss_c, 0.5 * KL_loss #best
-        return vae_loss, recon_loss_s, 2.0 * recon_loss_c, 0.5 * KL_loss
+        return vae_loss, pred_state_loss, 2.0 * param_action_loss, 0.5 * KL_loss
 
-    def train_step(self, s1, a1, a2, s2, sup_batch_size, embed_lr=1e-4):
-        state = s1
-        action_d = a1
-        action_c = a2
-        next_state = s2
-        vae_loss, recon_loss_s, recon_loss_c, KL_loss = self.loss(state, action_d, action_c, next_state,
-                                                                  sup_batch_size)
+    def step(self, state, action, parameter_action, next_state, embed_lr=1e-4):
+        
+        state_batch = state.to(self.device)
+        action_batch = self.get_embedding(action).to(self.device)
+        parameter_action_batch = parameter_action.to(self.device)
+        next_state_batch = next_state.to(self.device)
 
-        # 更新VAE
+
+        vae_loss, recon_loss_s, recon_loss_c, KL_loss = self.cal_loss(state_batch, action_batch, parameter_action_batch, next_state_batch)
+
         self.vae_optimizer = torch.optim.Adam(self.vae.parameters(), lr=embed_lr)
         self.vae_optimizer.zero_grad()
         vae_loss.backward()
@@ -178,13 +179,6 @@ class Action_representation(NeuralNet):
             action_c, state = self.vae.decode(state, z, action)
         return action_c.cpu().data.numpy().flatten()
 
-    # def select_delta_state(self, state, z, action):
-    #     with torch.no_grad():
-    #         state = torch.FloatTensor(state.reshape(1, -1)).to(self.device)
-    #         z = torch.FloatTensor(z.reshape(1, -1)).to(self.device)
-    #         action = torch.FloatTensor(action.reshape(1, -1)).to(self.device)
-    #         action_c, state = self.vae.decode(state, z, action)
-    #     return state.cpu().data.numpy().flatten()
     def select_delta_state(self, state, z, action):
         with torch.no_grad():
             action_c, state = self.vae.decode(state, z, action)

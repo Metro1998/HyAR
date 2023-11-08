@@ -266,7 +266,7 @@ def run(args):
                                 save_dir=save_dir, vae_save_model=vae_save_model, embed_lr=1e-4)
 
     print("c_rate", c_rate)
-    print("discrete embedding", action_rep.discrete_embedding())
+    print("discrete embedding", action_rep.retrieve_embedding())
 
     # -------TD3训练------
     print("TD3 train")
