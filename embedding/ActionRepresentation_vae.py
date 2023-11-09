@@ -125,23 +125,12 @@ class Action_representation(NeuralNet):
 
         return self.vae.embeddings
 
-    # def unsupervised_loss(self, s1, a1, a2, s2, sup_batch_size, embed_lr):
+    def cal_loss(self, state, action, parameter_action, state_residual):
 
-    #     a1 = self.get_embedding(a1).to(self.device)
+        pred_param_action, pred_state_residual, mean, std = self.vae(state, action, parameter_action)
 
-    #     s1 = s1.to(self.device)
-    #     s2 = s2.to(self.device)
-    #     a2 = a2.to(self.device)
-
-    #     vae_loss, recon_loss_d, recon_loss_c, KL_loss = self.step(s1, a1, a2, s2, sup_batch_size, embed_lr)
-    #     return vae_loss, recon_loss_d, recon_loss_c, KL_loss
-
-    def cal_loss(self, state, action, parameter_action, next_state):
-
-        recon_param_action, pred_state, mean, std = self.vae(state, action, parameter_action)
-
-        param_action_loss = F.mse_loss(recon_param_action, parameter_action, size_average=True) 
-        pred_state_loss = F.mse_loss(pred_state, next_state, size_average=True) # 最终不是用residual state 进行的mse？
+        param_action_loss = F.mse_loss(pred_param_action, parameter_action, size_average=True) 
+        pred_state_loss = F.mse_loss(pred_state_residual, state_residual, size_average=True)
         
 
         KL_loss = -0.5 * (1 + torch.log(std.pow(2)) - mean.pow(2) - std.pow(2)).mean()
@@ -192,8 +181,7 @@ class Action_representation(NeuralNet):
 
     def get_match_scores(self, action):
         # compute similarity probability based on L2 norm
-        embeddings = self.vae.embeddings
-        embeddings = torch.tanh(embeddings)
+        embeddings = torch.tanh(self.retrieve_embedding())
         action = action.to(self.device)
         # compute similarity probability based on L2 norm
         similarity = - pairwise_distances(action, embeddings)  # Negate euclidean to convert diff into similarity score
@@ -204,13 +192,62 @@ class Action_representation(NeuralNet):
     def select_discrete_action(self, action):
         similarity = self.get_match_scores(action)
         val, pos = torch.max(similarity, dim=1)
-        # print("pos",pos,len(pos))
+
         if len(pos) == 1:
             return pos.cpu().item()  # data.numpy()[0]
         else:
-            # print("pos.cpu().item()", pos.cpu().numpy())
             return pos.cpu().numpy()
 
+    def retrieve_scale_offset(self, state, action, parameter_action, c_percent_rate=5):
+        """
+        Latent Space Constraint (LSC)
+        Retrieve the scale and offset for each dimension of the latent space.
+        """
+        
+        state_batch = state.to(self.device)
+        action_batch = self.get_embedding(action).to(self.device)
+        parameter_action_batch = parameter_action.to(self.device)
+
+        z, _, _ = self.vae.encode(state_batch, action_batch, parameter_action_batch)
+        z = z.cpu().data.numpy()
+
+        c_percent_borders = self.retrieve_c_percent_borders(z, c_percent_rate)
+
+        scales = []
+        offsets = []
+
+        # Calculate scales and offsets based on c_percent_borders
+        for dim in range(len(c_percent_borders)):
+            scale = (c_percent_borders[dim][0] - c_percent_borders[dim][1]) / 2.0
+            offset = (c_percent_borders[dim][0] + c_percent_borders[dim][1]) / 2.0
+            scales.append(scale)
+            offsets.append(offset)
+
+        return scales, offsets
+
+    def retrieve_c_percent_borders(self, z, c_percent_rate=4):
+        batch_size = z.shape[0] # Assuming the shape of z is [batch_size, num_dim]
+        num_dim = z.shape[1]  
+        border_idx = int(c_percent_rate / 100 * batch_size)
+
+        # Initialize lists to store values for each dimension
+        z_values = [[] for _ in range(num_dim)]
+        c_percent_borders = [[] for _ in range(num_dim)] # c_percent_borders: [[c_up, c_down], [c_up, c_down], ...]
+
+        # Iterate over each sample
+        for i in range(len(z)):
+            for dim in range(num_dim):
+                z_values[dim].append(z[i][dim])
+
+        # Sort the data for each dimension and calculate c_percent_borders
+        for dim in range(num_dim):
+            z_values[dim].sort()
+            c_percent_up = z_values[dim][-border_idx - 1]
+            c_percent_down = z_values[dim][border_idx]
+            c_percent_borders[dim].extend([c_percent_up, c_percent_down])
+
+        return c_percent_borders
+    
     def save(self, filename, directory):
         torch.save(self.vae.state_dict(), '%s/%s_vae.pth' % (directory, filename))
         # torch.save(self.vae.embeddings, '%s/%s_embeddings.pth' % (directory, filename))
@@ -218,333 +255,3 @@ class Action_representation(NeuralNet):
     def load(self, filename, directory):
         self.vae.load_state_dict(torch.load('%s/%s_vae.pth' % (directory, filename), map_location=self.device))
         # self.vae.embeddings = torch.load('%s/%s_embeddings.pth' % (directory, filename), map_location=self.device)
-
-    def get_c_rate(self, s1, a1, a2, s2, batch_size=100, range_rate=5):
-        a1 = self.get_embedding(a1).to(self.device)
-        s1 = s1.to(self.device)
-        s2 = s2.to(self.device)
-        a2 = a2.to(self.device)
-        recon_c, recon_s, mean, std = self.vae(s1, a1, a2)
-        # print("recon_s",recon_s.shape)
-        z = mean + std * torch.randn_like(std)
-        z = z.cpu().data.numpy()
-        c_rate = self.z_range(z, batch_size, range_rate)
-        # print("s2",s2.shape)
-
-        recon_s_loss = F.mse_loss(recon_s, s2, size_average=True)
-
-        # recon_s = abs(np.mean(recon_s.cpu().data.numpy()))
-        return c_rate, recon_s_loss.detach().cpu().numpy()
-
-    def z_range(self, z, batch_size=100, range_rate=5):
-
-        self.z1, self.z2, self.z3, self.z4, self.z5, self.z6, self.z7, self.z8, self.z9,\
-        self.z10,self.z11,self.z12,self.z13,self.z14,self.z15,self.z16 = [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], []
-        border = int(range_rate * (batch_size / 100))
-
-        # print("border",border)
-        if len(z[0]) == 16:
-            for i in range(len(z)):
-                self.z1.append(z[i][0])
-                self.z2.append(z[i][1])
-                self.z3.append(z[i][2])
-                self.z4.append(z[i][3])
-                self.z5.append(z[i][4])
-                self.z6.append(z[i][5])
-                self.z7.append(z[i][6])
-                self.z8.append(z[i][7])
-                self.z9.append(z[i][8])
-                self.z10.append(z[i][9])
-                self.z11.append(z[i][10])
-                self.z12.append(z[i][11])
-                self.z13.append(z[i][12])
-                self.z14.append(z[i][13])
-                self.z15.append(z[i][14])
-                self.z16.append(z[i][15])
-
-        if len(z[0]) == 16:
-            self.z1.sort(), self.z2.sort(), self.z3.sort(), self.z4.sort(), self.z5.sort(), self.z6.sort(), self.z7.sort(), self.z8.sort(), \
-            self.z9.sort(), self.z10.sort(), self.z11.sort(), self.z12.sort(),self.z13.sort(), self.z14.sort(), self.z15.sort(), self.z16.sort()
-            c_rate_1_up = self.z1[-border - 1]
-            c_rate_1_down = self.z1[border]
-            c_rate_2_up = self.z2[-border - 1]
-            c_rate_2_down = self.z2[border]
-            c_rate_3_up = self.z3[-border - 1]
-            c_rate_3_down = self.z3[border]
-            c_rate_4_up = self.z4[-border - 1]
-            c_rate_4_down = self.z4[border]
-            c_rate_5_up = self.z5[-border - 1]
-            c_rate_5_down = self.z5[border]
-            c_rate_6_up = self.z6[-border - 1]
-            c_rate_6_down = self.z6[border]
-            c_rate_7_up = self.z7[-border - 1]
-            c_rate_7_down = self.z7[border]
-            c_rate_8_up = self.z8[-border - 1]
-            c_rate_8_down = self.z8[border]
-            c_rate_9_up = self.z9[-border - 1]
-            c_rate_9_down = self.z9[border]
-            c_rate_10_up = self.z10[-border - 1]
-            c_rate_10_down = self.z10[border]
-            c_rate_11_up = self.z11[-border - 1]
-            c_rate_11_down = self.z11[border]
-            c_rate_12_up = self.z12[-border - 1]
-            c_rate_12_down = self.z12[border]
-            c_rate_13_up = self.z13[-border - 1]
-            c_rate_13_down = self.z13[border]
-            c_rate_14_up = self.z14[-border - 1]
-            c_rate_14_down = self.z14[border]
-            c_rate_15_up = self.z15[-border - 1]
-            c_rate_15_down = self.z15[border]
-            c_rate_16_up = self.z16[-border - 1]
-            c_rate_16_down = self.z16[border]
-
-            c_rate_1, c_rate_2, c_rate_3, c_rate_4, c_rate_5, c_rate_6, c_rate_7, c_rate_8, \
-            c_rate_9, c_rate_10, c_rate_11, c_rate_12, c_rate_13, c_rate_14, c_rate_15, c_rate_16 = [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], []
-            c_rate_1.append(c_rate_1_up), c_rate_1.append(c_rate_1_down)
-            c_rate_2.append(c_rate_2_up), c_rate_2.append(c_rate_2_down)
-            c_rate_3.append(c_rate_3_up), c_rate_3.append(c_rate_3_down)
-            c_rate_4.append(c_rate_4_up), c_rate_4.append(c_rate_4_down)
-            c_rate_5.append(c_rate_5_up), c_rate_5.append(c_rate_5_down)
-            c_rate_6.append(c_rate_6_up), c_rate_6.append(c_rate_6_down)
-            c_rate_7.append(c_rate_7_up), c_rate_7.append(c_rate_7_down)
-            c_rate_8.append(c_rate_8_up), c_rate_8.append(c_rate_8_down)
-            c_rate_9.append(c_rate_9_up), c_rate_9.append(c_rate_9_down)
-            c_rate_10.append(c_rate_10_up), c_rate_10.append(c_rate_10_down)
-            c_rate_11.append(c_rate_11_up), c_rate_11.append(c_rate_11_down)
-            c_rate_12.append(c_rate_12_up), c_rate_12.append(c_rate_12_down)
-            c_rate_13.append(c_rate_13_up), c_rate_13.append(c_rate_13_down)
-            c_rate_14.append(c_rate_14_up), c_rate_14.append(c_rate_14_down)
-            c_rate_15.append(c_rate_15_up), c_rate_15.append(c_rate_15_down)
-            c_rate_16.append(c_rate_16_up), c_rate_16.append(c_rate_16_down)
-
-            return c_rate_1, c_rate_2, c_rate_3, c_rate_4, c_rate_5, c_rate_6, c_rate_7, c_rate_8,\
-                   c_rate_9, c_rate_10, c_rate_11, c_rate_12,c_rate_13, c_rate_14, c_rate_15, c_rate_16
-
-        if len(z[0]) == 12:
-            for i in range(len(z)):
-                self.z1.append(z[i][0])
-                self.z2.append(z[i][1])
-                self.z3.append(z[i][2])
-                self.z4.append(z[i][3])
-                self.z5.append(z[i][4])
-                self.z6.append(z[i][5])
-                self.z7.append(z[i][6])
-                self.z8.append(z[i][7])
-                self.z9.append(z[i][8])
-                self.z10.append(z[i][9])
-                self.z11.append(z[i][10])
-                self.z12.append(z[i][11])
-
-        if len(z[0]) == 12:
-            self.z1.sort(), self.z2.sort(), self.z3.sort(), self.z4.sort(), self.z5.sort(), self.z6.sort(), self.z7.sort(), self.z8.sort(), \
-            self.z9.sort(), self.z10.sort(), self.z11.sort(), self.z12.sort()
-            c_rate_1_up = self.z1[-border - 1]
-            c_rate_1_down = self.z1[border]
-            c_rate_2_up = self.z2[-border - 1]
-            c_rate_2_down = self.z2[border]
-            c_rate_3_up = self.z3[-border - 1]
-            c_rate_3_down = self.z3[border]
-            c_rate_4_up = self.z4[-border - 1]
-            c_rate_4_down = self.z4[border]
-            c_rate_5_up = self.z5[-border - 1]
-            c_rate_5_down = self.z5[border]
-            c_rate_6_up = self.z6[-border - 1]
-            c_rate_6_down = self.z6[border]
-            c_rate_7_up = self.z7[-border - 1]
-            c_rate_7_down = self.z7[border]
-            c_rate_8_up = self.z8[-border - 1]
-            c_rate_8_down = self.z8[border]
-            c_rate_9_up = self.z9[-border - 1]
-            c_rate_9_down = self.z9[border]
-            c_rate_10_up = self.z10[-border - 1]
-            c_rate_10_down = self.z10[border]
-            c_rate_11_up = self.z11[-border - 1]
-            c_rate_11_down = self.z11[border]
-            c_rate_12_up = self.z12[-border - 1]
-            c_rate_12_down = self.z12[border]
-            c_rate_1, c_rate_2, c_rate_3, c_rate_4, c_rate_5, c_rate_6, c_rate_7, c_rate_8, c_rate_9, c_rate_10, c_rate_11, c_rate_12 = [], [], [], [], [], [], [], [], [], [], [], []
-            c_rate_1.append(c_rate_1_up), c_rate_1.append(c_rate_1_down)
-            c_rate_2.append(c_rate_2_up), c_rate_2.append(c_rate_2_down)
-            c_rate_3.append(c_rate_3_up), c_rate_3.append(c_rate_3_down)
-            c_rate_4.append(c_rate_4_up), c_rate_4.append(c_rate_4_down)
-            c_rate_5.append(c_rate_5_up), c_rate_5.append(c_rate_5_down)
-            c_rate_6.append(c_rate_6_up), c_rate_6.append(c_rate_6_down)
-            c_rate_7.append(c_rate_7_up), c_rate_7.append(c_rate_7_down)
-            c_rate_8.append(c_rate_8_up), c_rate_8.append(c_rate_8_down)
-            c_rate_9.append(c_rate_9_up), c_rate_9.append(c_rate_9_down)
-            c_rate_10.append(c_rate_10_up), c_rate_10.append(c_rate_10_down)
-            c_rate_11.append(c_rate_11_up), c_rate_11.append(c_rate_11_down)
-            c_rate_12.append(c_rate_12_up), c_rate_12.append(c_rate_12_down)
-            return c_rate_1, c_rate_2, c_rate_3, c_rate_4, c_rate_5, c_rate_6, c_rate_7, c_rate_8, c_rate_9, c_rate_10, c_rate_11, c_rate_12
-
-        if len(z[0]) == 10:
-            for i in range(len(z)):
-                self.z1.append(z[i][0])
-                self.z2.append(z[i][1])
-                self.z3.append(z[i][2])
-                self.z4.append(z[i][3])
-                self.z5.append(z[i][4])
-                self.z6.append(z[i][5])
-                self.z7.append(z[i][6])
-                self.z8.append(z[i][7])
-                self.z9.append(z[i][8])
-                self.z10.append(z[i][9])
-
-        if len(z[0]) == 10:
-            self.z1.sort(), self.z2.sort(), self.z3.sort(), self.z4.sort(), self.z5.sort(), self.z6.sort(), self.z7.sort(), self.z8.sort(), self.z9.sort(), self.z10.sort()
-            c_rate_1_up = self.z1[-border - 1]
-            c_rate_1_down = self.z1[border]
-            c_rate_2_up = self.z2[-border - 1]
-            c_rate_2_down = self.z2[border]
-            c_rate_3_up = self.z3[-border - 1]
-            c_rate_3_down = self.z3[border]
-            c_rate_4_up = self.z4[-border - 1]
-            c_rate_4_down = self.z4[border]
-            c_rate_5_up = self.z5[-border - 1]
-            c_rate_5_down = self.z5[border]
-            c_rate_6_up = self.z6[-border - 1]
-            c_rate_6_down = self.z6[border]
-            c_rate_7_up = self.z7[-border - 1]
-            c_rate_7_down = self.z7[border]
-            c_rate_8_up = self.z8[-border - 1]
-            c_rate_8_down = self.z8[border]
-            c_rate_9_up = self.z9[-border - 1]
-            c_rate_9_down = self.z9[border]
-            c_rate_10_up = self.z10[-border - 1]
-            c_rate_10_down = self.z10[border]
-            c_rate_1, c_rate_2, c_rate_3, c_rate_4, c_rate_5, c_rate_6, c_rate_7, c_rate_8, c_rate_9, c_rate_10 = [], [], [], [], [], [], [], [], [], []
-            c_rate_1.append(c_rate_1_up), c_rate_1.append(c_rate_1_down)
-            c_rate_2.append(c_rate_2_up), c_rate_2.append(c_rate_2_down)
-            c_rate_3.append(c_rate_3_up), c_rate_3.append(c_rate_3_down)
-            c_rate_4.append(c_rate_4_up), c_rate_4.append(c_rate_4_down)
-            c_rate_5.append(c_rate_5_up), c_rate_5.append(c_rate_5_down)
-            c_rate_6.append(c_rate_6_up), c_rate_6.append(c_rate_6_down)
-            c_rate_7.append(c_rate_7_up), c_rate_7.append(c_rate_7_down)
-            c_rate_8.append(c_rate_8_up), c_rate_8.append(c_rate_8_down)
-            c_rate_9.append(c_rate_9_up), c_rate_9.append(c_rate_9_down)
-            c_rate_10.append(c_rate_10_up), c_rate_10.append(c_rate_10_down)
-            return c_rate_1, c_rate_2, c_rate_3, c_rate_4, c_rate_5, c_rate_6, c_rate_7, c_rate_8, c_rate_9, c_rate_10
-
-        if len(z[0]) == 8:
-            for i in range(len(z)):
-                self.z1.append(z[i][0])
-                self.z2.append(z[i][1])
-                self.z3.append(z[i][2])
-                self.z4.append(z[i][3])
-                self.z5.append(z[i][4])
-                self.z6.append(z[i][5])
-                self.z7.append(z[i][6])
-                self.z8.append(z[i][7])
-
-        if len(z[0]) == 8:
-            self.z1.sort(), self.z2.sort(), self.z3.sort(), self.z4.sort(), self.z5.sort(), self.z6.sort(), self.z7.sort(), self.z8.sort()
-            c_rate_1_up = self.z1[-border - 1]
-            c_rate_1_down = self.z1[border]
-            c_rate_2_up = self.z2[-border - 1]
-            c_rate_2_down = self.z2[border]
-            c_rate_3_up = self.z3[-border - 1]
-            c_rate_3_down = self.z3[border]
-            c_rate_4_up = self.z4[-border - 1]
-            c_rate_4_down = self.z4[border]
-            c_rate_5_up = self.z5[-border - 1]
-            c_rate_5_down = self.z5[border]
-            c_rate_6_up = self.z6[-border - 1]
-            c_rate_6_down = self.z6[border]
-            c_rate_7_up = self.z7[-border - 1]
-            c_rate_7_down = self.z7[border]
-            c_rate_8_up = self.z8[-border - 1]
-            c_rate_8_down = self.z8[border]
-            c_rate_1, c_rate_2, c_rate_3, c_rate_4, c_rate_5, c_rate_6, c_rate_7, c_rate_8 = [], [], [], [], [], [], [], []
-            c_rate_1.append(c_rate_1_up), c_rate_1.append(c_rate_1_down)
-            c_rate_2.append(c_rate_2_up), c_rate_2.append(c_rate_2_down)
-            c_rate_3.append(c_rate_3_up), c_rate_3.append(c_rate_3_down)
-            c_rate_4.append(c_rate_4_up), c_rate_4.append(c_rate_4_down)
-            c_rate_5.append(c_rate_5_up), c_rate_5.append(c_rate_5_down)
-            c_rate_6.append(c_rate_6_up), c_rate_6.append(c_rate_6_down)
-            c_rate_7.append(c_rate_7_up), c_rate_7.append(c_rate_7_down)
-            c_rate_8.append(c_rate_8_up), c_rate_8.append(c_rate_8_down)
-            return c_rate_1, c_rate_2, c_rate_3, c_rate_4, c_rate_5, c_rate_6, c_rate_7, c_rate_8
-
-        if len(z[0]) == 6:
-            for i in range(len(z)):
-                self.z1.append(z[i][0])
-                self.z2.append(z[i][1])
-                self.z3.append(z[i][2])
-                self.z4.append(z[i][3])
-                self.z5.append(z[i][4])
-                self.z6.append(z[i][5])
-
-        if len(z[0]) == 6:
-            self.z1.sort(), self.z2.sort(), self.z3.sort(), self.z4.sort(), self.z5.sort(), self.z6.sort()
-            c_rate_1_up = self.z1[-border - 1]
-            c_rate_1_down = self.z1[border]
-            c_rate_2_up = self.z2[-border - 1]
-            c_rate_2_down = self.z2[border]
-            c_rate_3_up = self.z3[-border - 1]
-            c_rate_3_down = self.z3[border]
-            c_rate_4_up = self.z4[-border - 1]
-            c_rate_4_down = self.z4[border]
-            c_rate_5_up = self.z5[-border - 1]
-            c_rate_5_down = self.z5[border]
-            c_rate_6_up = self.z6[-border - 1]
-            c_rate_6_down = self.z6[border]
-
-            c_rate_1, c_rate_2, c_rate_3, c_rate_4, c_rate_5, c_rate_6 = [], [], [], [], [], []
-            c_rate_1.append(c_rate_1_up), c_rate_1.append(c_rate_1_down)
-            c_rate_2.append(c_rate_2_up), c_rate_2.append(c_rate_2_down)
-            c_rate_3.append(c_rate_3_up), c_rate_3.append(c_rate_3_down)
-            c_rate_4.append(c_rate_4_up), c_rate_4.append(c_rate_4_down)
-            c_rate_5.append(c_rate_5_up), c_rate_5.append(c_rate_5_down)
-            c_rate_6.append(c_rate_6_up), c_rate_6.append(c_rate_6_down)
-
-            return c_rate_1, c_rate_2, c_rate_3, c_rate_4, c_rate_5, c_rate_6
-
-        if len(z[0]) == 4:
-            for i in range(len(z)):
-                self.z1.append(z[i][0])
-                self.z2.append(z[i][1])
-                self.z3.append(z[i][2])
-                self.z4.append(z[i][3])
-
-        if len(z[0]) == 4:
-            self.z1.sort(), self.z2.sort(), self.z3.sort(), self.z4.sort()
-            # print("lenz1",len(self.z1),self.z1)
-            c_rate_1_up = self.z1[-border - 1]
-            c_rate_1_down = self.z1[border]
-            c_rate_2_up = self.z2[-border - 1]
-            c_rate_2_down = self.z2[border]
-            c_rate_3_up = self.z3[-border - 1]
-            c_rate_3_down = self.z3[border]
-            c_rate_4_up = self.z4[-border - 1]
-            c_rate_4_down = self.z4[border]
-
-            c_rate_1, c_rate_2, c_rate_3, c_rate_4 = [], [], [], []
-            c_rate_1.append(c_rate_1_up), c_rate_1.append(c_rate_1_down)
-            c_rate_2.append(c_rate_2_up), c_rate_2.append(c_rate_2_down)
-            c_rate_3.append(c_rate_3_up), c_rate_3.append(c_rate_3_down)
-            c_rate_4.append(c_rate_4_up), c_rate_4.append(c_rate_4_down)
-
-            return c_rate_1, c_rate_2, c_rate_3, c_rate_4
-
-        if len(z[0]) == 3:
-            for i in range(len(z)):
-                self.z1.append(z[i][0])
-                self.z2.append(z[i][1])
-                self.z3.append(z[i][2])
-
-        if len(z[0]) == 3:
-            self.z1.sort(), self.z2.sort(), self.z3.sort()
-            # print("lenz1",len(self.z1),self.z1)
-            c_rate_1_up = self.z1[-border - 1]
-            c_rate_1_down = self.z1[border]
-            c_rate_2_up = self.z2[-border - 1]
-            c_rate_2_down = self.z2[border]
-            c_rate_3_up = self.z3[-border - 1]
-            c_rate_3_down = self.z3[border]
-
-            c_rate_1, c_rate_2, c_rate_3 = [], [], []
-            c_rate_1.append(c_rate_1_up), c_rate_1.append(c_rate_1_down)
-            c_rate_2.append(c_rate_2_up), c_rate_2.append(c_rate_2_down)
-            c_rate_3.append(c_rate_3_up), c_rate_3.append(c_rate_3_down)
-
-            return c_rate_1, c_rate_2, c_rate_3
