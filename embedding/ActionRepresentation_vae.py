@@ -202,6 +202,9 @@ class Action_representation(NeuralNet):
         """
         Latent Space Constraint (LSC)
         Retrieve the scale and offset for each dimension of the latent space.
+        
+        Different with papar, it seems it only impose the constraint on the latent parameter action.
+        Moreover, the the latent parameter action is not normalized to [-1, 1] by tanh activation.
         """
         
         state_batch = state.to(self.device)
